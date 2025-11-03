@@ -207,7 +207,13 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	log.G(ctx).Debugf("Container %q spec: %#+v", id, spew.NewFormatter(spec))
 
 	// Grab any platform specific snapshotter opts.
-	sOpts := snapshotterOpts(c.config.ContainerdConfig.Snapshotter, config)
+	// Pass containerName, sandboxAnnotations, and all mounts for overlay-rw-layer-spec support
+	// Combine config mounts (CSI volumes, etc.) with volumeMounts (image volumes)
+	configMounts := config.GetMounts()
+	allMounts := make([]*runtime.Mount, 0, len(configMounts)+len(volumeMounts))
+	allMounts = append(allMounts, configMounts...)
+	allMounts = append(allMounts, volumeMounts...)
+	sOpts := snapshotterOpts(c.config.ContainerdConfig.Snapshotter, config, containerName, sandboxConfig.GetAnnotations(), allMounts)
 
 	// Set snapshotter before any other options.
 	opts := []containerd.NewContainerOpts{

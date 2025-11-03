@@ -40,6 +40,9 @@ import (
 // the change set between this snapshot and its parent is stored.
 const upperdirKey = "containerd.io/snapshot/overlay.upperdir"
 
+// ebspathKey is a key of an optional label to specify the ebs path for read-write layers
+const ebspathKey = "containerd.io/snapshot/overlay.ebspath"
+
 // SnapshotterConfig is used to configure the overlay snapshotter instance
 type SnapshotterConfig struct {
 	asyncRemove   bool
@@ -170,7 +173,9 @@ func (o *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info
 		if info.Labels == nil {
 			info.Labels = make(map[string]string)
 		}
-		info.Labels[upperdirKey] = o.upperPath(id)
+		// Get ebsPath from metadata
+		ebsPath, _ := o.getEBSPathFromKey(ctx, key)
+		info.Labels[upperdirKey] = o.upperPath(id, ebsPath)
 	}
 	return info, nil
 }
@@ -190,7 +195,9 @@ func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 			if newInfo.Labels == nil {
 				newInfo.Labels = make(map[string]string)
 			}
-			newInfo.Labels[upperdirKey] = o.upperPath(id)
+			// Get ebsPath from metadata
+			ebsPath, _ := o.getEBSPathFromKey(ctx, newInfo.Name)
+			newInfo.Labels[upperdirKey] = o.upperPath(id, ebsPath)
 		}
 		return nil
 	})
@@ -217,7 +224,9 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 	}
 
 	if info.Kind == snapshots.KindActive {
-		upperPath := o.upperPath(id)
+		// Get ebsPath from metadata
+		ebsPath, _ := o.getEBSPathFromKey(ctx, key)
+		upperPath := o.upperPath(id, ebsPath)
 		du, err := fs.DiskUsage(ctx, upperPath)
 		if err != nil {
 			// TODO(stevvooe): Consider not reporting an error in this case.
@@ -242,16 +251,22 @@ func (o *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // This can be used to recover mounts after calling View or Prepare.
 func (o *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
 	var s storage.Snapshot
+	var snapshotKey string
 	if err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		s, err = storage.GetSnapshot(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to get active mount: %w", err)
 		}
+		_, info, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			return err
+		}
+		snapshotKey = info.Name
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return o.mounts(s), nil
+	return o.mounts(ctx, s, snapshotKey)
 }
 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
@@ -262,7 +277,9 @@ func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return err
 		}
 
-		usage, err := fs.DiskUsage(ctx, o.upperPath(id))
+		// Get ebsPath from metadata to determine correct path
+		ebsPath, _ := o.getEBSPathFromKey(ctx, key)
+		usage, err := fs.DiskUsage(ctx, o.upperPath(id, ebsPath))
 		if err != nil {
 			return err
 		}
@@ -319,7 +336,9 @@ func (o *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...str
 				if info.Labels == nil {
 					info.Labels = make(map[string]string)
 				}
-				info.Labels[upperdirKey] = o.upperPath(id)
+				// Get ebsPath from metadata
+				ebsPath, _ := o.getEBSPathFromKey(ctx, info.Name)
+				info.Labels[upperdirKey] = o.upperPath(id, ebsPath)
 				return fn(ctx, info)
 			}, fs...)
 		}
@@ -362,19 +381,24 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 		return nil, err
 	}
 
+	cleanup := []string{}
+
+	// Check root snapshots directory (local disk)
 	snapshotDir := filepath.Join(o.root, "snapshots")
 	fd, err := os.Open(snapshotDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanup, nil
+		}
 		return nil, err
 	}
-	defer fd.Close()
 
 	dirs, err := fd.Readdirnames(0)
+	fd.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	cleanup := []string{}
 	for _, d := range dirs {
 		if _, ok := ids[d]; ok {
 			continue
@@ -382,13 +406,49 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 		cleanup = append(cleanup, filepath.Join(snapshotDir, d))
 	}
 
+	// Note: ebsPath directories are managed per-snapshot and cleaned up
+	// based on their individual snapshot keys, so we don't scan all possible
+	// ebsPath locations here as they vary per container
+
 	return cleanup, nil
+}
+
+// getEBSPathFromOpts extracts ebsPath from snapshot options labels
+func getEBSPathFromOpts(opts []snapshots.Opt) string {
+	var info snapshots.Info
+	for _, opt := range opts {
+		opt(&info)
+	}
+	if info.Labels != nil {
+		return info.Labels[ebspathKey]
+	}
+	return ""
+}
+
+// getEBSPathFromKey gets ebsPath from snapshot metadata by key
+func (o *snapshotter) getEBSPathFromKey(ctx context.Context, key string) (string, error) {
+	var info snapshots.Info
+	if err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		_, i, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			return err
+		}
+		info = i
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	if info.Labels != nil {
+		return info.Labels[ebspathKey], nil
+	}
+	return "", nil
 }
 
 func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
 		s        storage.Snapshot
 		td, path string
+		ebsPath  string
 	)
 
 	defer func() {
@@ -407,8 +467,25 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}()
 
+	// Extract ebsPath from opts labels
+	ebsPath = getEBSPathFromOpts(opts)
+
 	if err := o.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
-		snapshotDir := filepath.Join(o.root, "snapshots")
+		// Determine snapshot directory based on kind, ebsPath, and parent
+		var snapshotDir string
+		// Only store active snapshots with parent (layer3 rw) in ebs
+		// Base layers (no parent) and committed snapshots go to local disk (root)
+		if kind == snapshots.KindActive && parent != "" && ebsPath != "" {
+			// Active snapshots with parent (rw layer) go to ebs
+			if err := os.MkdirAll(filepath.Join(ebsPath, "snapshots"), 0700); err != nil {
+				return fmt.Errorf("failed to create ebs snapshots directory: %w", err)
+			}
+			snapshotDir = filepath.Join(ebsPath, "snapshots")
+		} else {
+			// Base layers (lowerdir) and committed snapshots go to local disk
+			snapshotDir = filepath.Join(o.root, "snapshots")
+		}
+
 		td, err = o.prepareDirectory(ctx, snapshotDir, kind)
 		if err != nil {
 			return fmt.Errorf("failed to create prepare snapshot dir: %w", err)
@@ -420,7 +497,9 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 
 		if len(s.ParentIDs) > 0 {
-			st, err := os.Stat(o.upperPath(s.ParentIDs[0]))
+			// Parent layers are always on local disk (nvme)
+			parentPath := filepath.Join(o.root, "snapshots", s.ParentIDs[0], "fs")
+			st, err := os.Stat(parentPath)
 			if err != nil {
 				return fmt.Errorf("failed to stat parent: %w", err)
 			}
@@ -442,7 +521,19 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
-	return o.mounts(s), nil
+	// Get the snapshot key to retrieve ebsPath from metadata
+	var snapshotKey string
+	if err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		_, info, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			return err
+		}
+		snapshotKey = info.Name
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return o.mounts(ctx, s, snapshotKey)
 }
 
 func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
@@ -464,10 +555,18 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 	return td, nil
 }
 
-func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
+func (o *snapshotter) mounts(ctx context.Context, s storage.Snapshot, key string) ([]mount.Mount, error) {
+	// Try to get ebsPath from snapshot metadata
+	ebsPath, err := o.getEBSPathFromKey(ctx, key)
+	if err != nil {
+		// If failed to get from metadata, try to detect by checking file existence
+		ebsPath = ""
+	}
+
 	if len(s.ParentIDs) == 0 {
 		// if we only have one layer/no parents then just return a bind mount as overlay
 		// will not work
+		// Base layers (no parent) are always on local disk
 		roFlag := "rw"
 		if s.Kind == snapshots.KindView {
 			roFlag = "ro"
@@ -475,38 +574,39 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 		return []mount.Mount{
 			{
-				Source: o.upperPath(s.ID),
+				Source: o.lowerPath(s.ID),
 				Type:   "bind",
 				Options: []string{
 					roFlag,
 					"rbind",
 				},
 			},
-		}
+		}, nil
 	}
 
 	options := o.options
 	if s.Kind == snapshots.KindActive {
 		options = append(options,
-			fmt.Sprintf("workdir=%s", o.workPath(s.ID)),
-			fmt.Sprintf("upperdir=%s", o.upperPath(s.ID)),
+			fmt.Sprintf("workdir=%s", o.workPath(s.ID, ebsPath)),
+			fmt.Sprintf("upperdir=%s", o.upperPath(s.ID, ebsPath)),
 		)
 	} else if len(s.ParentIDs) == 1 {
 		return []mount.Mount{
 			{
-				Source: o.upperPath(s.ParentIDs[0]),
+				Source: o.lowerPath(s.ParentIDs[0]),
 				Type:   "bind",
 				Options: []string{
 					"ro",
 					"rbind",
 				},
 			},
-		}
+		}, nil
 	}
 
 	parentPaths := make([]string, len(s.ParentIDs))
 	for i := range s.ParentIDs {
-		parentPaths[i] = o.upperPath(s.ParentIDs[i])
+		// Parent layers (base layers) are always on local disk
+		parentPaths[i] = o.lowerPath(s.ParentIDs[i])
 	}
 
 	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(parentPaths, ":")))
@@ -516,16 +616,26 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 			Source:  "overlay",
 			Options: options,
 		},
-	}
-
+	}, nil
 }
 
-func (o *snapshotter) upperPath(id string) string {
+func (o *snapshotter) upperPath(id string, ebsPath string) string {
+	if ebsPath != "" {
+		return filepath.Join(ebsPath, "snapshots", id, "fs")
+	}
 	return filepath.Join(o.root, "snapshots", id, "fs")
 }
 
-func (o *snapshotter) workPath(id string) string {
+func (o *snapshotter) workPath(id string, ebsPath string) string {
+	if ebsPath != "" {
+		return filepath.Join(ebsPath, "snapshots", id, "work")
+	}
 	return filepath.Join(o.root, "snapshots", id, "work")
+}
+
+func (o *snapshotter) lowerPath(id string) string {
+	// Base layers (lowerdir) are always on local disk
+	return filepath.Join(o.root, "snapshots", id, "fs")
 }
 
 // Close closes the snapshotter

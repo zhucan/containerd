@@ -32,7 +32,8 @@ func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageCon
 }
 
 // snapshotterOpts returns any Windows specific snapshotter options for the r/w layer
-func snapshotterOpts(snapshotterName string, config *runtime.ContainerConfig) []snapshots.Opt {
+// Additional parameters are for overlay-rw-layer-spec support (Linux only)
+func snapshotterOpts(snapshotterName string, config *runtime.ContainerConfig, containerName string, sandboxAnnotations map[string]string, allMounts []*runtime.Mount) []snapshots.Opt {
 	var opts []snapshots.Opt
 
 	switch snapshotterName {
